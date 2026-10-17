@@ -29,17 +29,29 @@ what's missing.
 """
 import argparse
 import asyncio
+import base64
 import datetime
+import json
 import pathlib
 import random
 import struct
 import sys
+import time
+import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parent
 LOG = ROOT / "logs" / "server.log"
+# Stats and race results, kept between runs (see Stats).
+DATA = ROOT / "data"
 
 DIR_PORT = 30960
 LOBBY_PORT = 10901
+# Not part of EA's protocol: the app asks here whether a gamertag is free before
+# letting the player in (one line in, one line out; see check_gamertag).
+CHECK_PORT = 10902
+# How long a checked gamertag stays held for the device that checked it (see
+# Server.reserve). Changed with --hold-minutes.
+HOLD_SECONDS = 10 * 60
 
 
 def log(text):
@@ -80,10 +92,144 @@ class Session:
         self.maddr = ""
         self.opparam = ""
         self.auxi = ""
+        # Set by auth: until then `name` is only the placeholder.
+        self.authenticated = False
         # User sets it is subscribed to: room name -> slot (0..4).
         self.sets = {}
         Session.count = getattr(Session, "count", 0) + 1
         self.id = Session.count
+
+
+class Stats:
+    """Personal stats and leaderboards, kept in data/stats.json.
+
+    What the game reads (from its code, 2026-10-16):
+      - Personal stats come in the reply to 'user' (sub_8254DE78): STAT, and
+        LWSTAT / LMSTAT, the same stats as they were at the start of the week
+        and of the month (the game subtracts them to show the progress), plus
+        LGAME. Each is 44 numbers in hex, comma-separated (the game's "l*"
+        format, sub_82817358). 0-7 are general (1 and 2 are divided by the
+        ranked / unranked races: disconnects?), then 12 per race mode (three
+        modes): at 8+12m the points, at 9..12+12m ranked wins, ranked losses,
+        unranked wins, unranked losses.
+      - A leaderboard row is a '+snp' (sub_8282E968 / sub_82826190): N name,
+        R position, P points, O, and S = 7 numbers in the same format (the
+        rows on screen use 1 and 2 as wins / losses and 6 as points,
+        sub_8227E138).
+    Race results come in 'rank' (see parse_results). Each player reports the
+    whole race, but only its own result is counted, so a race doesn't count
+    twice. Still unknown: which race mode each block of STAT is (MODE_BLOCK),
+    and how the original servers gave points (POINTS_PER_PLACE is ours).
+    """
+
+    LENGTH = 44
+    MODES = 3
+    FIRST_MODE = 8
+    PER_MODE = 12
+    # Room parameter M (the race mode: 2 is Circuit, seen 2026-10-16) -> block of
+    # STAT. Only Circuit is known; the rest go to the first block for now and are
+    # logged, to fill this in.
+    MODE_BLOCK = {2: 0}
+    # Points for finishing in position p out of n: (n - p + 1) * this.
+    POINTS_PER_PLACE = 10
+
+    @staticmethod
+    def parse_results(data):
+        """RESU, decoded: (players, reporter index, [(player index, position)]).
+
+        Read from races between two phones (2026-10-16):
+          0       version (3)
+          1       number of players
+          2       ? (1 or 2)
+          3       index of the player who sends it
+          4..7    ? (07 D0 00 01 so far)
+          8...    a block per player: index, position (1 = winner), 2 bytes,
+                  float percent complete, then floats (finish time, speeds...),
+                  48 bytes in all after index and position; then a count and
+                  that many more bytes. The order of the blocks isn't the
+                  finishing order.
+        """
+        if len(data) < 8 or data[0] != 3:
+            raise ValueError("unknown results version")
+        players, reporter = data[1], data[3]
+        places, o = [], 8
+        for _ in range(players):
+            if o + 51 > len(data):
+                raise ValueError("results cut short")
+            places.append((data[o], data[o + 1]))
+            o += 51 + data[o + 50]
+        return players, reporter, places
+
+    def add_result(self, name, players, position, mode, ranked):
+        """One race of `name`: finished `position` of `players` in race mode `mode`."""
+        p = self.player(name)
+        block = self.FIRST_MODE + self.PER_MODE * self.MODE_BLOCK.get(mode, 0)
+        won = position == 1
+        p["stat"][block] += (players - position + 1) * self.POINTS_PER_PLACE
+        p["stat"][block + (1 if won else 2) + (0 if ranked else 2)] += 1
+        p["last_game"] = int(time.time())
+        self.save()
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.path = folder / "stats.json"
+        try:
+            self.players = json.loads(self.path.read_text(encoding="utf-8"))["players"]
+        except (OSError, ValueError, KeyError):
+            self.players = {}
+
+    def save(self):
+        self.folder.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"players": self.players}, indent=1), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def player(self, name):
+        key = name.strip().casefold()
+        p = self.players.setdefault(key, {"name": name.strip(), "stat": [0] * self.LENGTH,
+                                          "week": None, "month": None, "last_game": 0})
+        # Start of a new week / month: what the stats were then.
+        today = datetime.date.today()
+        week = "%d-W%02d" % today.isocalendar()[:2]
+        month = today.strftime("%Y-%m")
+        for period, ident in (("week", week), ("month", month)):
+            if not p[period] or p[period]["id"] != ident:
+                p[period] = {"id": ident, "stat": list(p["stat"])}
+        return p
+
+    @staticmethod
+    def text(values):
+        return ",".join(("-%x" % -v) if v < 0 else ("%x" % v) for v in values)
+
+    def personal(self, name):
+        p = self.player(name)
+        self.save()
+        return {
+            "STAT": self.text(p["stat"]),
+            "LWSTAT": self.text(p["week"]["stat"]),
+            "LMSTAT": self.text(p["month"]["stat"]),
+            "LGAME": p["last_game"],
+        }
+
+    def totals(self, p):
+        st = p["stat"]
+        points = wins = losses = 0
+        for m in range(self.MODES):
+            b = self.FIRST_MODE + self.PER_MODE * m
+            points += st[b]
+            wins += st[b + 1] + st[b + 3]
+            losses += st[b + 2] + st[b + 4]
+        return points, wins, losses
+
+    def leaderboard(self):
+        """[(position, name, points, row stats)], best first: everyone who has raced."""
+        rows = []
+        for p in self.players.values():
+            points, wins, losses = self.totals(p)
+            if wins + losses:
+                rows.append((points, wins, p["name"], [0, wins, losses, 0, 0, 0, points]))
+        rows.sort(key=lambda r: (-r[0], -r[1], r[2].casefold()))
+        return [(i + 1, name, points, row) for i, (points, _, name, row) in enumerate(rows)]
 
 
 class Server:
@@ -93,15 +239,33 @@ class Server:
         self.games = {}
         self.sessions = set()
         self.next_id = 1000
+        # Gamertags held for a device: casefolded name -> (IP, name, expiry in
+        # time.monotonic()). One per IP. See reserve().
+        self.holds = {}
+        self.stats = Stats(DATA)
 
     def forget(self, ses):
         """The player left: their room disappears and they leave their game."""
         self.leave_game(ses)
+        # Their name stays held for their device a while longer, so nobody else
+        # takes it the moment they step out of Xbox Live.
+        if ses.authenticated:
+            self.reserve(ses.persona or ses.name, ses.ip)
         if ses.room in self.rooms:
             self.notify_set(self.rooms[ses.room], ses, ses, remove=True)  # their own copy goes nowhere
-        if ses.room in self.rooms and self.rooms[ses.room]["O"] == (ses.persona or ses.name):
-            log(f"   room {ses.room} of {self.rooms[ses.room]['O']} deleted")
-            del self.rooms[ses.room]
+        for room in [r for r in self.rooms.values() if r.get("owner") is ses]:
+            self.drop_room(room, ses)
+
+    def drop_room(self, room, owner):
+        """Delete a room: whoever is still in it leaves (its subscribers hear it)."""
+        for member in self.members(room):
+            if member is not owner:
+                self.notify_set(room, member, None, remove=True)
+                member.room = None
+        if owner.room == room["I"]:
+            owner.room = None
+        self.rooms.pop(room["I"], None)
+        log(f"   room {room['I']} ({room['N']}) of {room['O']} deleted")
 
     # -- directory --------------------------------------------------------
     def dir_(self, ses, fields):
@@ -200,20 +364,91 @@ class Server:
         return own
 
     def user(self, ses, fields):
-        # Asks for a profile's record (on login, its own).
-        return [pack_message(b"user", {
-            "PERS": fields.get("PERS", ses.persona or ses.name),
+        # Asks for a profile's record (on login, its own; also the personal
+        # stats screen): its stats go here (Stats).
+        name = fields.get("PERS", ses.persona or ses.name)
+        record = {
+            "PERS": name,
             "LAST": "2005.11.15-00:00:00",
             "EXPR": "1072566000",
-            "STAT": "",
-        })]
+        }
+        record.update(self.stats.personal(name))
+        return [pack_message(b"user", record)]
+
+    def snap(self, ses, fields):
+        # A leaderboard query: CHAN (where the game puts the rows, 5..22), INDEX
+        # (which leaderboard) and START/RANGE (from where, how many) or FIND=$
+        # (where am I). The reply has to repeat CHAN and say in RANGE how many
+        # '+snp' rows follow (LobbyRanks SnapCB, sub_8253E610; 0 = none): with an
+        # empty reply the game took channel 0 and wrote outside its table.
+        rows = self.stats.leaderboard()
+        if fields.get("FIND"):
+            me = (ses.persona or ses.name).casefold()
+            rows = [r for r in rows if r[1].casefold() == me]
+        else:
+            start = int(fields.get("START", 0) or 0)
+            count = int(fields.get("RANGE", 100) or 100)
+            rows = rows[start:start + count]
+        reply = [pack_message(b"snap", {"CHAN": fields.get("CHAN", "0"),
+                                          "START": fields.get("START", 0),
+                                          "RANGE": len(rows)})]
+        for position, name, points, row in rows:
+            reply.append(pack_message(b"+snp", {"N": name, "R": position, "P": points, "O": 0,
+                                                 "S": Stats.text(row)}))
+        return reply
+
+    def rank(self, ses, fields):
+        # The results of a race, from each player when it ends: REPT who sends
+        # them, WHEN the game's start time, RESU the results (base64, URL-encoded).
+        # The sender's own position goes to its stats (Stats.add_result), with the
+        # race mode and whether it's ranked from its room. Everything is also kept
+        # as it came (data/races.jsonl).
+        name = fields.get("REPT") or ses.persona or ses.name
+        mode, ranked = self.race_settings(ses)
+        try:
+            data = base64.b64decode(urllib.parse.unquote(fields.get("RESU", "")))
+        except ValueError:
+            data = b""
+        counted = None
+        try:
+            players, reporter, places = Stats.parse_results(data)
+            position = dict(places).get(reporter)
+            if position:
+                self.stats.add_result(name, players, position, mode, ranked)
+                counted = position
+                if mode not in Stats.MODE_BLOCK:
+                    log(f"   race mode M={mode} not mapped to a STAT block yet: counted in the first one")
+        except ValueError as e:
+            log(f"   rank from {name}: {e}")
+        log(f"   rank: {name} finished {counted} of the race (M={mode}, ranked={ranked})")
+        DATA.mkdir(parents=True, exist_ok=True)
+        with (DATA / "races.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"time": datetime.datetime.now().isoformat(timespec="seconds"),
+                                "from": name, "fields": fields, "results": data.hex(),
+                                "mode": mode, "ranked": ranked, "counted": counted}) + "\n")
+        return [pack_message(b"rank", {})]
+
+    def race_settings(self, ses):
+        """(race mode M, ranked) from the parameters of the room ses is in:
+        PARAMS is URL-encoded KEY=value lines, e.g. V=192641 P=1 E=... L=3 M=2
+        (L laps, M mode). P=1 is taken as ranked ("Clasificacion: Si")."""
+        room = self.rooms.get(ses.room)
+        params = {}
+        for line in urllib.parse.unquote(room["P"] if room else "").splitlines():
+            key, _, value = line.partition("=")
+            params[key.strip()] = value.strip()
+        try:
+            mode = int(params.get("M", 2))
+        except ValueError:
+            mode = 2
+        return mode, params.get("P", "1") == "1"
 
     def usea(self, ses, fields):
         # Player room search (the Quick Match one, with CUSTFLAGS/CUSTMASK).
         # The reply only says how many (COUNT); each one arrives afterwards in a
         # '+uss' with its record: the game's message table (0x828F2264) sends
         # '+uss' to sub_8282EF18, which puts it in the results list.
-        others = [s for s in self.rooms.values() if s["O"] != (ses.persona or ses.name)]
+        others = [s for s in self.rooms.values() if s.get("owner") is not ses]
         r = [pack_message(b"usea", {"START": fields.get("START", 0), "COUNT": len(others)})]
         r += [pack_message(b"+uss", self.room_record(s)) for s in others]
         return r
@@ -387,6 +622,17 @@ class Server:
         reply += self.notify_set(room, ses, ses)
         return reply
 
+    def udel(self, ses, fields):
+        # The owner deletes their room: the game sends it right after gdel when it
+        # backs out of "Create game". It used to get an empty reply and the room
+        # stayed listed until the owner disconnected, so Quick Match and Custom
+        # Match filled up with copies of the same name (2026-10-16), and joining
+        # one of them led nowhere.
+        room = self.room_by_name(fields.get("NAME", "")) or self.rooms.get(ses.room)
+        if room and room.get("owner") is ses:
+            self.drop_room(room, ses)
+        return [pack_message(b"udel", {})]
+
     def ulea(self, ses, fields):
         room = self.rooms.get(ses.room)
         if room and int(room["C"]) > 1:
@@ -449,7 +695,10 @@ class Server:
 
     def ucre(self, ses, fields):
         # Create a player room ("Crear partida" — "Create game" — in Quick Match).
-        # Afterwards, the game sends gcre to create the game inside it.
+        # Afterwards, the game sends gcre to create the game inside it. A player
+        # has one room: any older one of theirs still listed goes first.
+        for old in [r for r in self.rooms.values() if r.get("owner") is ses]:
+            self.drop_room(old, ses)
         self.next_id += 1
         room = {
             "I": self.next_id,
@@ -462,6 +711,9 @@ class Server:
             "N": fields.get("NAME", ""),
             "D": "",
             "P": fields.get("PARAMS", ""),
+            # Not sent (room_record picks its keys): the session that owns it. The
+            # name in "O" isn't enough if two phones go by the same gamertag.
+            "owner": ses,
         }
         self.rooms[room["I"]] = room
         ses.room = room["I"]
@@ -518,6 +770,12 @@ class Server:
     def auth(self, ses, fields):
         ses.name = fields.get("NAME") or fields.get("GTAG") or ses.name
         ses.maddr = fields.get("MADDR", ses.maddr)
+        ses.authenticated = True
+        other = self.who_uses(ses.name, ses.ip)
+        if other:
+            # The app checks before letting the player in (CHECK_PORT); an older
+            # app, or a race between two phones, still gets here.
+            log(f"   warning: gamertag '{ses.name}' already in use by {other}")
         return [pack_message(b"auth", {
             "NAME": ses.name,
             "ADDR": ses.ip,
@@ -541,6 +799,29 @@ class Server:
             "LA": ses.ip,
             "IDLE": 600000,
         })]
+
+    def who_uses(self, gamertag, ip):
+        """The IP of another device that has this gamertag right now: connected
+        with it, or holding it (reserve). None if it's free for `ip`. Like Xbox
+        Live, case doesn't matter."""
+        wanted = gamertag.strip().casefold()
+        for other in self.sessions:
+            if other.ip == ip or not other.authenticated:
+                continue
+            if wanted in {n.casefold() for n in (other.name, other.persona) if n}:
+                return other.ip
+        hold = self.holds.get(wanted)
+        if hold and hold[0] != ip and hold[2] > time.monotonic():
+            return hold[0]
+        return None
+
+    def reserve(self, gamertag, ip):
+        """Hold `gamertag` for the device at `ip` for HOLD_SECONDS. A device holds
+        one name: whatever it held before is released (it changed gamertag)."""
+        now = time.monotonic()
+        name = gamertag.strip()
+        self.holds = {k: v for k, v in self.holds.items() if v[0] != ip and v[2] > now}
+        self.holds[name.casefold()] = (ip, name, now + HOLD_SECONDS)
 
     def png(self, ses, fields):
         # The client's answer to our ping: no reply (it would be a ping loop).
@@ -609,20 +890,51 @@ async def handle_client(reader, writer, server, port):
     writer.close()
 
 
+async def check_gamertag(reader, writer, server):
+    """The app's question: one line "GAMERTAG <name>", one line back: "FREE" or
+    "IN_USE". In use = another device is connected with that name or holds it.
+    The asking device's own session and hold don't count: it's the same player.
+    A FREE answer also holds the name for the asking device (reserve), so two
+    phones can't both be told a name is free and then meet in the lobby."""
+    peer = writer.get_extra_info("peername")
+    try:
+        line = (await asyncio.wait_for(reader.readline(), 5)).decode("utf-8", "replace").strip()
+        command, _, gamertag = line.partition(" ")
+        if command != "GAMERTAG" or not gamertag.strip():
+            answer = "ERROR"
+        else:
+            other = server.who_uses(gamertag, peer[0])
+            answer = "IN_USE" if other else "FREE"
+            if not other:
+                server.reserve(gamertag, peer[0])
+            log(f"[{CHECK_PORT}] {peer[0]} asks about '{gamertag.strip()}': {answer}"
+                + (f" ({other})" if other else " (held for it)"))
+        writer.write(answer.encode() + b"\n")
+        await writer.drain()
+    except (asyncio.TimeoutError, ConnectionError):
+        pass
+    writer.close()
+
+
 async def run(ip):
     server = Server(ip)
     for p in (DIR_PORT, LOBBY_PORT):
         await asyncio.start_server(lambda r, w, p=p: handle_client(r, w, server, p), "0.0.0.0", p)
-    log(f"EA server on {ip}: directory {DIR_PORT}, lobby {LOBBY_PORT}")
+    await asyncio.start_server(lambda r, w: check_gamertag(r, w, server), "0.0.0.0", CHECK_PORT)
+    log(f"EA server on {ip}: directory {DIR_PORT}, lobby {LOBBY_PORT}, gamertag check {CHECK_PORT}")
     await asyncio.Event().wait()
 
 
 def main():
-    global LOG
+    global LOG, HOLD_SECONDS
     ap = argparse.ArgumentParser(description="Minimal EA lobby server for the LAN.")
     ap.add_argument("--ip", required=True, help="this PC's IP on the LAN (the one given in red_dns)")
     ap.add_argument("--log", help=f"log file (default {LOG})")
+    ap.add_argument("--hold-minutes", type=float, default=HOLD_SECONDS / 60,
+                    help="how long a checked gamertag stays held for that device"
+                         f" (default {HOLD_SECONDS // 60})")
     a = ap.parse_args()
+    HOLD_SECONDS = a.hold_minutes * 60
     if a.log:
         LOG = pathlib.Path(a.log).resolve()
     LOG.parent.mkdir(parents=True, exist_ok=True)

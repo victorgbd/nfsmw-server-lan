@@ -42,10 +42,41 @@ Giving the PC a fixed IP in the router avoids this.
 |---|---|
 | `--ip <IP>` | The PC's IP on the LAN. Required: it's what the phones are given as the lobby server address. |
 | `--log <file>` | Where to write the log. Defaults to `logs/server.log`, next to the script. |
+| `--hold-minutes <n>` | How long a checked gamertag stays held for the phone that checked it (below). Default 10. |
 
-The server listens on all interfaces, on TCP **30960** (directory) and **10901**
-(lobby). The phones talk to each other over UDP **3658** (game) and **6000** (voice),
-without going through the PC.
+The server listens on all interfaces, on TCP **30960** (directory), **10901**
+(lobby) and **10902** (gamertag check, below). The phones talk to each other over UDP
+**3658** (game) and **6000** (voice), without going through the PC.
+
+### Gamertag check
+
+Two players with the same gamertag break the lobby (rooms and games go by name), so
+the app asks before letting you in. When you set a server, change your gamertag, open
+the app, or press Play, it connects to TCP **10902** and sends one line,
+`GAMERTAG <name>`; the server answers `FREE` or `IN_USE`.
+
+- *In use* means **another device** (another IP) is connected to this server with
+  that name, or holds it. Case doesn't matter, like Xbox Live. Your own device
+  never counts against you.
+- A `FREE` answer also **holds** the name for the phone that asked, for 10 minutes
+  (`--hold-minutes`). That way two phones can't both be told a name is free and then
+  meet in the lobby. A phone holds one name: checking another one releases the
+  previous hold at once.
+- While the app's main screen is open it checks again every minute, so the hold
+  doesn't run out while you're there; pressing Play renews it, which leaves time
+  to boot the game and reach Xbox Live, where the connection itself counts. When a
+  player leaves Xbox Live, their name stays held for their phone for another 10
+  minutes.
+- Holds live in memory: restarting the server clears them.
+- If it's in use, the app marks the gamertag field and won't start the game until
+  you change the gamertag or the server. With no server set, nothing is checked.
+- If the server doesn't answer (it's down, or an older version without this port),
+  the app says so and lets you play.
+- An older app that doesn't check can still log in with a name already in use: the
+  server lets it in and logs a `warning: gamertag ... already in use`.
+
+You can try it by hand with any TCP client, e.g. `ncat 10.0.0.2 10902` and type
+`GAMERTAG victor`.
 
 ## What's here
 
@@ -95,6 +126,30 @@ The hard-won parts, in case they need changing:
   treats the match as lost) and `MA` (without it the link between players ends up with
   no XUID).
 
+### Stats and leaderboards (work in progress)
+
+Read from the game's code; kept in `data/stats.json` (and every race result as it
+comes in `data/races.jsonl`), next to the script.
+
+- **Personal stats** go in the reply to `user`: `STAT`, plus `LWSTAT` / `LMSTAT` (the
+  same stats at the start of the week / month: the game subtracts them to show the
+  progress) and `LGAME`. Each is 44 numbers in hex, comma-separated. 0–7 are general;
+  then 12 per race mode, three modes: at 8+12m the points, then ranked wins, ranked
+  losses, unranked wins, unranked losses.
+- **Leaderboards** (and the Blacklist 15) are `snap` queries: `CHAN` (where the game
+  stores the rows), `INDEX` (which leaderboard), `START`/`RANGE` or `FIND=$` (where am
+  I). The reply repeats `CHAN` and says in `RANGE` how many rows follow, each a `+snp`
+  with `N` name, `R` position, `P` points, `O` and `S` (7 numbers, same format: 1 and 2
+  wins / losses, 6 points). `RANGE=0` means an empty leaderboard.
+- **Race results** come in `rank` (`RESU`, URL-encoded base64) from each player when a
+  race ends, with the whole race in it: byte 1 the number of players, byte 3 the index
+  of the sender, then from byte 8 a block per player with its index and **position**
+  (then floats: times, speeds...; 48 bytes, then a count and that many more bytes).
+  Each player's own position goes to its stats, so a race doesn't count twice. The
+  race mode and whether it's ranked come from the room (`M`, `P` in its parameters).
+  Points are ours: (players − position + 1) × 10. Still unknown: which `M` is each
+  block of `STAT` (only Circuit, `M=2`, is mapped) and what each `INDEX` is.
+
 Unknown commands are answered with the same command and no data, and are logged as
 `(unhandled command: replying empty)`: that's
 the first thing to look for if something gets stuck.
@@ -104,9 +159,10 @@ in `docs/diario/red-y-privilegios.md`.
 
 ## Limitations
 
-- A single LAN only. No NAT, no accounts, and nothing that persists state between
-  runs: restarting the server makes the connected games lose their session, and you
-  have to go back into Xbox Live.
+- A single LAN only. No NAT and no accounts. Only the stats persist between runs:
+  restarting the server makes the connected games lose their session, and you have
+  to go back into Xbox Live.
 - If a phone goes to the background during a race, Android kills it and the other
   player finishes alone.
-- Leaderboards, friends and news are not implemented: they get empty replies.
+- Friends and news are not implemented: they get empty replies. Stats and
+  leaderboards answer in the right format but stay at 0 (see above).

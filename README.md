@@ -9,6 +9,26 @@ servers on a PC on the same network. The game connects to it for the lobby (room
 games, player list), and then the phones race connected **directly to each other**
 over UDP. The PC never sees the race traffic.
 
+## Reviving the 360 online with community servers
+
+The bigger goal is to bring back the Xbox 360 version's online play. EA shut down
+its servers years ago, and this project re-implements the protocol the game speaks
+to them. Anyone can then run their own server, open to whoever they want to play
+with: no EA, and no single server everything depends on.
+
+The pieces the game needs are already here: the lobby, rooms, games, the player list,
+gamertags, and stats and leaderboards (still in progress). For now it only works on a
+LAN. Running a community server over the internet still needs NAT traversal (players
+race peer to peer) and some kind of accounts (see [Limitations](#limitations)).
+Contributions toward that are welcome.
+
+## No PC? A phone can host
+
+The app has this same server built in (a Java port, `ServidorEa.java` in the NFSMW
+Recompiled repository): turn on **"Host on this phone"** under "LAN server" on one
+phone, and the others enter the IP it shows. That phone races too. It works on a
+Wi-Fi or over that phone's own hotspot. A protocol change here has to be made there
+as well.
 
 ## Requirements
 

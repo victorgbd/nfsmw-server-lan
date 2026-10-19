@@ -34,6 +34,7 @@ import datetime
 import json
 import pathlib
 import random
+import socket
 import struct
 import sys
 import time
@@ -49,6 +50,12 @@ LOBBY_PORT = 10901
 # Not part of EA's protocol: the app asks here whether a gamertag is free before
 # letting the player in (one line in, one line out; see check_gamertag).
 CHECK_PORT = 10902
+# Also not EA's: the app looks for servers on the LAN by sending a UDP datagram
+# "NFSMW_DISCOVER" to this same port number (broadcast, and to every address of
+# its /24); the server answers with its name and how many players it has (see
+# Discovery). The name is --name, or the PC's.
+DISCOVER = b"NFSMW_DISCOVER"
+NAME = socket.gethostname()
 # How long a checked gamertag stays held for the device that checked it (see
 # Server.reserve). Changed with --hold-minutes.
 HOLD_SECONDS = 10 * 60
@@ -916,24 +923,62 @@ async def check_gamertag(reader, writer, server):
     writer.close()
 
 
+class Discovery(asyncio.DatagramProtocol):
+    """The app's server search: "NFSMW_DISCOVER" in, and back to whoever asked
+
+        NFSMW_SERVER
+        NAME=<name>
+        PLAYERS=<players in Xbox Live>
+
+    Anything else is ignored (it's a broadcast port: no answers to strangers)."""
+
+    def __init__(self, server):
+        self.server = server
+        self.transport = None
+        # Each search arrives several times (broadcast and direct, three rounds):
+        # logged once per IP every 10 s.
+        self.logged = {}
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        if not data.startswith(DISCOVER):
+            return
+        players = sum(1 for s in self.server.sessions if s.authenticated)
+        reply = f"NFSMW_SERVER\nNAME={NAME}\nPLAYERS={players}\n"
+        self.transport.sendto(reply.encode("utf-8"), addr)
+        now = time.monotonic()
+        if now - self.logged.get(addr[0], -60) < 10:
+            return
+        self.logged[addr[0]] = now
+        log(f"[{CHECK_PORT}/udp] search from {addr[0]}: answered '{NAME}', {players} players")
+
+
 async def run(ip):
     server = Server(ip)
     for p in (DIR_PORT, LOBBY_PORT):
         await asyncio.start_server(lambda r, w, p=p: handle_client(r, w, server, p), "0.0.0.0", p)
     await asyncio.start_server(lambda r, w: check_gamertag(r, w, server), "0.0.0.0", CHECK_PORT)
-    log(f"EA server on {ip}: directory {DIR_PORT}, lobby {LOBBY_PORT}, gamertag check {CHECK_PORT}")
+    await asyncio.get_running_loop().create_datagram_endpoint(
+        lambda: Discovery(server), local_addr=("0.0.0.0", CHECK_PORT))
+    log(f"EA server on {ip} ('{NAME}'): directory {DIR_PORT}, lobby {LOBBY_PORT},"
+        f" gamertag check {CHECK_PORT}, LAN search {CHECK_PORT}/udp")
     await asyncio.Event().wait()
 
 
 def main():
-    global LOG, HOLD_SECONDS
+    global LOG, HOLD_SECONDS, NAME
     ap = argparse.ArgumentParser(description="Minimal EA lobby server for the LAN.")
     ap.add_argument("--ip", required=True, help="this PC's IP on the LAN (the one given in red_dns)")
     ap.add_argument("--log", help=f"log file (default {LOG})")
     ap.add_argument("--hold-minutes", type=float, default=HOLD_SECONDS / 60,
                     help="how long a checked gamertag stays held for that device"
                          f" (default {HOLD_SECONDS // 60})")
+    ap.add_argument("--name", default=NAME,
+                    help=f"the name the app's server search shows (default: this PC's, {NAME})")
     a = ap.parse_args()
+    NAME = a.name.strip()[:24] or NAME
     HOLD_SECONDS = a.hold_minutes * 60
     if a.log:
         LOG = pathlib.Path(a.log).resolve()

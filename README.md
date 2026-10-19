@@ -49,7 +49,8 @@ as well.
    The first time, Windows asks whether to let Python accept incoming connections:
    allow it on **private networks**, or the phones won't be able to reach it.
 3. On each phone, in the app settings, under "Servidor LAN (multijugador)" (LAN server
-   (multiplayer)), enter the same IP. Each phone must have a **different gamertag**.
+   (multiplayer)), press **Search the network** and tap the server, or add it by hand
+   with the same IP. Each phone must have a **different gamertag**.
 4. In the game: **Xbox Live → Quick Match**. One player creates a game and the others
    go into Quick Match and join it.
 
@@ -63,10 +64,30 @@ Giving the PC a fixed IP in the router avoids this.
 | `--ip <IP>` | The PC's IP on the LAN. Required: it's what the phones are given as the lobby server address. |
 | `--log <file>` | Where to write the log. Defaults to `logs/server.log`, next to the script. |
 | `--hold-minutes <n>` | How long a checked gamertag stays held for the phone that checked it (below). Default 10. |
+| `--name <name>` | The name the app's server search shows (below). Defaults to the PC's name. |
 
 The server listens on all interfaces, on TCP **30960** (directory), **10901**
-(lobby) and **10902** (gamertag check, below). The phones talk to each other over UDP
+(lobby) and **10902** (gamertag check, below), and on UDP **10902** (LAN search,
+below). The phones talk to each other over UDP
 **3658** (game) and **6000** (voice), without going through the PC.
+
+### LAN search
+
+The app's **Search the network** button sends one UDP datagram, `NFSMW_DISCOVER`, to
+port **10902**: three times to the broadcast address of its Wi-Fi (or hotspot), and
+once to every address of its /24, because some routers and phones drop broadcasts.
+It listens for 1.5 s. Every server that hears it answers to the sender with
+
+```
+NFSMW_SERVER
+NAME=<--name, or the PC's name>
+PLAYERS=<players in Xbox Live>
+```
+
+and the app lists them; tapping one saves it and selects it. A phone that hosts
+answers with its gamertag (or its model). The log shows one line per phone that
+searches, every 10 s at most. If the search doesn't find a PC that's running, check
+that Windows lets Python receive on private networks (UDP too).
 
 ### Gamertag check
 
